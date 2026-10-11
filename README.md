@@ -1,1 +1,4 @@
-# nokit-thermal-camera
+# Thermal Camera
+
+Thermal camera using mlx90640
+
