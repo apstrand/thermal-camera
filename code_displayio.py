@@ -1,6 +1,6 @@
 r"""Slower displayio version of the thermal camera, kept as a fallback.
 
-Measured 4.0 fps at 192x144 against code.py's 11.3, because displayio costs a
+Measured 4.0 fps at 192x144 against code.py's 10.0, because displayio costs a
 flat 5.4 us per displayed pixel on this board (150 ms for this image) and
 FourWire.send only reaches 2.19 MB/s where busio.SPI.write reaches 6.53.
 Shorter and less hand-rolled than code.py, so useful if the raw-SPI path ever
@@ -48,6 +48,9 @@ TEXT_EVERY = 8            # frames between text/NeoPixel updates
 #   scale 4  128x96   12288 px    66 ms draw    7.1 fps
 #   scale 3   96x72    6912 px    38 ms draw    9.0 fps
 #   scale 2   64x48    3072 px    17 ms draw   11.3 fps
+#
+# (those four were measured before the RGB565 packing fix, which added
+#  three floor passes; the raw-SPI code.py now runs 10.0 fps at scale 6)
 #
 # 6 keeps the original layout. Drop it for a smaller, faster image.
 IMAGE_SCALE = 6

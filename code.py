@@ -32,20 +32,26 @@ I2C_FREQ = 1_000_000       # MLX90640 supports FM+
 # 62.5 MHz is exact and measured 6.53 MB/s through busio.SPI.write.
 SPI_FREQ = 62_500_000
 
-# SMOOTH interpolates the temperature field 2x before colouring, so the
-# blocks are 3x3 instead of 6x6 and their edges are graded. Measured offline
-# on synthetic scenes: on a 0.6 degC/px gradient the mean run of identical
-# pixels drops 6.08 -> 3.10 and the distinct colour count rises 54 -> 115; on
-# a face-like warm blob, 8.86 -> 5.73 and 39 -> 58. It does nothing on a very
-# flat scene, where neighbouring sensor pixels already share a colour. It
-# costs framerate -- see the figure printed at startup.
+# SMOOTH interpolates the temperature field 2x before colouring, so blocks
+# are 3x3 instead of 6x6 and their edges are graded.
+#
+#   SMOOTH = False   6x6 blocks    10.0 fps
+#   SMOOTH = True    3x3 blocks     4.3 fps
+#
+# It is 4x the shading work, hence the cost. Measured offline on synthetic
+# scenes, the mean run of identical pixels and the distinct colour count:
+# a 0.6 degC/px gradient goes 6.08 -> 3.10 runs and 54 -> 115 colours; a
+# face-like warm blob 8.86 -> 5.73 and 39 -> 58. On a nearly flat scene it
+# changes almost nothing (7.57 -> 7.28), because neighbouring sensor pixels
+# already share a colour at 0.5 degC per step -- there is nothing to
+# interpolate between.
 SMOOTH = True
 
 SRC_W, SRC_H = 32, 24
 IMG_W, IMG_H = SRC_W * 6, SRC_H * 6             # 192 x 144 either way
 IMG_X, IMG_Y = (240 - IMG_W) // 2, 24
 
-TEXT_W, TEXT_H = 96, 32
+TEXT_W, TEXT_H = 64, 32
 TEXT_X, TEXT_Y = IMG_X, IMG_Y + IMG_H + 24
 TEXT_EVERY = 8
 
@@ -82,28 +88,47 @@ disp.fill(0, 0, 240, 320, BG565)
 pixel.fill((0, 255, 255))
 
 # --- renderer ------------------------------------------------------------
-# Smooth wants ~48 kB of buffers against Nearest's ~9 kB, and its first draw
-# is where any unsupported ulab slice assignment would surface. Prove both
-# before committing to it, so a failure degrades to a working camera instead
-# of a board that will not boot.
+# Force the sensor's lookup tables to be built first. _build_tables allocates
+# ~18 kB of Python list temporaries on top of its ~25 kB of ulab arrays, and
+# doing that after the renderer's buffers exist leaves too little headroom.
+mlx.wait_for_subpage()
+mlx.temperatures()
+gc.collect()
+print("free before renderer:", gc.mem_free())
+
+
 def _make_renderer():
-    if SMOOTH:
-        try:
-            r = renderer.Smooth(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
-            mlx.wait_for_subpage()
-            r.draw(mlx.temperatures())
-            print("renderer: Smooth (2x bilinear, 3x3 blocks)")
-            return r
-        except (MemoryError, TypeError, ValueError, IndexError) as err:
-            print("renderer: Smooth unavailable (%s: %s), falling back"
-                  % (type(err).__name__, err))
-            gc.collect()
-    r = renderer.Nearest(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
-    print("renderer: Nearest (6x6 blocks)")
-    return r
+    """Prefer Smooth, but never let its appetite stop the camera booting.
+
+    Nearest is built FIRST and only dropped once Smooth is proven. Trying
+    Smooth first and falling back does not work: a failed attempt leaves the
+    heap fragmented -- measured 46 kB free but no 9 kB contiguous block -- so
+    the fallback could not allocate either and the board would not boot.
+    """
+    safe = renderer.Nearest(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
+    if not SMOOTH:
+        print("renderer: Nearest (6x6 blocks)")
+        return safe
+
+    why = None
+    try:
+        r = renderer.Smooth(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
+        r.draw(mlx.temperatures())
+    except (MemoryError, TypeError, ValueError, IndexError) as err:
+        why = "%s: %s" % (type(err).__name__, err)
+        r = None
+    if r is not None:
+        print("renderer: Smooth (2x bilinear, 3x3 blocks)")
+        return r
+    # Outside the handler, so the exception and its traceback no longer pin
+    # Smooth's half-built buffers and this collect can actually reclaim them.
+    gc.collect()
+    print("renderer: Smooth unavailable (%s), using Nearest" % why)
+    return safe
 
 
 render = _make_renderer()
+gc.collect()
 
 text_strip = bytearray(TEXT_W * TEXT_H * 2)
 # Clearing this with a Python per-byte loop cost 92 ms per text update;
