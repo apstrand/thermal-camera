@@ -70,7 +70,8 @@ VDD_RECALC = 0.002
 class FastMLX90640(adafruit_mlx90640.MLX90640):
     """MLX90640 with a vectorised, allocation-free frame path."""
 
-    def __init__(self, i2c_bus, address=0x33, emissivity=0.95, release_cal=True):
+    def __init__(self, i2c_bus, address=0x33, emissivity=0.95, release_cal=True,
+                 refine=True):
         """release_cal frees the stock driver's per-pixel Python lists once
         they have been folded into ulab arrays, recovering about 15 kB. That
         makes the inherited getFrame() unusable, so pass False to keep it
@@ -83,6 +84,7 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         self.recalcs = 0
         self.subpage = 0
         self._release_cal = release_cal
+        self.refine = refine
         self._raw = bytearray(2 * N_WORDS)
         self._addrbuf = bytearray(2)
         self._cmdbuf = bytearray(4)
@@ -333,6 +335,11 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         to /= s
         to += ta_tr
         self._quartic_root(to)
+
+        if not self.refine:
+            for p in self._bad:
+                to[p] = to[p + 1] if p == 0 else to[p - 1]
+            return to
 
         # pass 3: coefficients chosen per ksTo range. A scene confined to one
         # range -- the normal case -- needs only two scalars.
