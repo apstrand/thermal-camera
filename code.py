@@ -18,6 +18,7 @@ from ulab import numpy as np
 import adafruit_mlx90640
 
 import font5x7
+import renderer
 from mlx90640_fast import FastMLX90640
 from st7789_fast import FastST7789
 
@@ -31,11 +32,18 @@ I2C_FREQ = 1_000_000       # MLX90640 supports FM+
 # 62.5 MHz is exact and measured 6.53 MB/s through busio.SPI.write.
 SPI_FREQ = 62_500_000
 
+# SMOOTH interpolates the temperature field 2x before colouring, so the
+# blocks are 3x3 instead of 6x6 and their edges are graded. Measured offline
+# on synthetic scenes: on a 0.6 degC/px gradient the mean run of identical
+# pixels drops 6.08 -> 3.10 and the distinct colour count rises 54 -> 115; on
+# a face-like warm blob, 8.86 -> 5.73 and 39 -> 58. It does nothing on a very
+# flat scene, where neighbouring sensor pixels already share a colour. It
+# costs framerate -- see the figure printed at startup.
+SMOOTH = True
+
 SRC_W, SRC_H = 32, 24
-SCALE = 6
-IMG_W, IMG_H = SRC_W * SCALE, SRC_H * SCALE     # 192 x 144
+IMG_W, IMG_H = SRC_W * 6, SRC_H * 6             # 192 x 144 either way
 IMG_X, IMG_Y = (240 - IMG_W) // 2, 24
-ROW_BYTES = IMG_W * 2
 
 TEXT_W, TEXT_H = 96, 32
 TEXT_X, TEXT_Y = IMG_X, IMG_Y + IMG_H + 24
@@ -73,54 +81,34 @@ disp = FastST7789(spi, command=board.GP0, chip_select=board.GP1, reset=board.GP8
 disp.fill(0, 0, 240, 320, BG565)
 pixel.fill((0, 255, 255))
 
-# --- buffers -------------------------------------------------------------
-# One image row per source row: 192 px of RGB565. The vertical scale-up is
-# done by writing each row to the panel 6 times, which avoids materialising
-# the 55 kB full-size image (two of those will not fit in the heap).
-row_ba = bytearray(ROW_BYTES * SRC_H)                      # 9216 B
-row16 = np.frombuffer(row_ba, dtype=np.uint16)             # view, 4608 px
-_views = [memoryview(row_ba)[r * ROW_BYTES:(r + 1) * ROW_BYTES] for r in range(SRC_H)]
-# Reversing src and writing the rows bottom-to-top mirrors the image
-# horizontally only, which is what the original code's 31-w index did.
-row_views = _views[::-1]
+# --- renderer ------------------------------------------------------------
+# Smooth wants ~48 kB of buffers against Nearest's ~9 kB, and its first draw
+# is where any unsupported ulab slice assignment would surface. Prove both
+# before committing to it, so a failure degrades to a working camera instead
+# of a board that will not boot.
+def _make_renderer():
+    if SMOOTH:
+        try:
+            r = renderer.Smooth(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
+            mlx.wait_for_subpage()
+            r.draw(mlx.temperatures())
+            print("renderer: Smooth (2x bilinear, 3x3 blocks)")
+            return r
+        except (MemoryError, TypeError, ValueError, IndexError) as err:
+            print("renderer: Smooth unavailable (%s: %s), falling back"
+                  % (type(err).__name__, err))
+            gc.collect()
+    r = renderer.Nearest(disp, TEMP_LO, TEMP_SPAN, IMG_X, IMG_Y)
+    print("renderer: Nearest (6x6 blocks)")
+    return r
+
+
+render = _make_renderer()
 
 text_strip = bytearray(TEXT_W * TEXT_H * 2)
 # Clearing this with a Python per-byte loop cost 92 ms per text update;
 # assigning a prebuilt image is a single memcpy.
 BG_STRIP = bytes((BG565 >> 8, BG565 & 0xFF)) * (TEXT_W * TEXT_H)
-
-# --- colour ramp ---------------------------------------------------------
-# The displayio version used a 64-entry palette. Reproducing it arithmetically
-# keeps the per-pixel work inside ulab: across the ramp R falls linearly,
-# G is a V (hence abs), and B rises then saturates.
-R_SLOPE = -31.0 / 63.0
-INV_SPAN = 1.0 / TEMP_SPAN
-
-
-def shade(temps):
-    """768 temperatures -> 768 big-endian RGB565 values."""
-    x = np.clip((temps - TEMP_LO) * INV_SPAN, 0.0, 63.0)
-
-    # Every field must be an integer BEFORE packing. Skipping these floors
-    # leaves R5 and G6 fractional, and a fractional R5 carries up to 2047
-    # into the green and blue fields -- adjacent ramp steps then differ by
-    # tens instead of ones, which on screen is random colour noise.
-    r = x * R_SLOPE
-    r += 31.0
-    np.floor(r, out=r)
-    r *= 2048.0                      # R5 << 11
-
-    g = abs(x - 31.5)
-    g *= 2.0                         # G6 = |x - 31.5| * 2
-    np.floor(g, out=g)
-    g *= 32.0                        # G6 << 5
-    r += g
-
-    b = np.minimum(x, 31.0)          # B5
-    np.floor(b, out=b)
-    r += b
-    return np.array(r, dtype=np.uint16).byteswap()
-
 
 CENTER = [h * SRC_W + w for h in range(10, 14) for w in range(14, 18)]
 
@@ -142,12 +130,7 @@ while True:
         errors += 1
         continue
 
-    src = np.array(shade(temps)[::-1], dtype=np.uint16)
-    for k in range(SCALE):
-        row16[k::SCALE] = src
-
-    disp.set_window(IMG_X, IMG_Y, IMG_X + IMG_W - 1, IMG_Y + IMG_H - 1)
-    disp.blit_repeat_rows(row_views, SCALE)
+    render.draw(temps)
 
     if tick % TEXT_EVERY == 0:
         lo = np.min(temps)
