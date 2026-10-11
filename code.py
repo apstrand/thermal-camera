@@ -93,23 +93,33 @@ BG_STRIP = bytes((BG565 >> 8, BG565 & 0xFF)) * (TEXT_W * TEXT_H)
 # The displayio version used a 64-entry palette. Reproducing it arithmetically
 # keeps the per-pixel work inside ulab: across the ramp R falls linearly,
 # G is a V (hence abs), and B rises then saturates.
-# R5 << 11 as a single multiply-add: R5 = 31 - x*31/63, so
-# R5 * 2048 == x * (-31/63 * 2048) + 31 * 2048.
-R_MUL = -31.0 / 63.0 * 2048.0
-R_ADD = 31.0 * 2048.0
+R_SLOPE = -31.0 / 63.0
 INV_SPAN = 1.0 / TEMP_SPAN
 
 
 def shade(temps):
     """768 temperatures -> 768 big-endian RGB565 values."""
     x = np.clip((temps - TEMP_LO) * INV_SPAN, 0.0, 63.0)
-    c = x * R_MUL
-    c += R_ADD                       # R5 << 11
+
+    # Every field must be an integer BEFORE packing. Skipping these floors
+    # leaves R5 and G6 fractional, and a fractional R5 carries up to 2047
+    # into the green and blue fields -- adjacent ramp steps then differ by
+    # tens instead of ones, which on screen is random colour noise.
+    r = x * R_SLOPE
+    r += 31.0
+    np.floor(r, out=r)
+    r *= 2048.0                      # R5 << 11
+
     g = abs(x - 31.5)
-    g *= 64.0                        # G6 << 5, with G6 = |x-31.5| * 2
-    c += g
-    c += np.minimum(x, 31.0)         # B5
-    return np.array(c, dtype=np.uint16).byteswap()
+    g *= 2.0                         # G6 = |x - 31.5| * 2
+    np.floor(g, out=g)
+    g *= 32.0                        # G6 << 5
+    r += g
+
+    b = np.minimum(x, 31.0)          # B5
+    np.floor(b, out=b)
+    r += b
+    return np.array(r, dtype=np.uint16).byteswap()
 
 
 CENTER = [h * SRC_W + w for h in range(10, 14) for w in range(14, 18)]
