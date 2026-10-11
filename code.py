@@ -35,9 +35,10 @@ SPI_FREQ = 62_500_000
 # SMOOTH interpolates the temperature field 2x before colouring, so blocks
 # are 3x3 instead of 6x6 and their edges are graded.
 #
-#   SMOOTH = False   6x6 blocks    10.0 fps
+#   SMOOTH = False   6x6 blocks    10.0 fps   (default)
 #   SMOOTH = True    3x3 blocks     4.3 fps
 #
+# Flip it here; renderer.Smooth stays available either way.
 # It is 4x the shading work, hence the cost. Measured offline on synthetic
 # scenes, the mean run of identical pixels and the distinct colour count:
 # a 0.6 degC/px gradient goes 6.08 -> 3.10 runs and 54 -> 115 colours; a
@@ -45,7 +46,7 @@ SPI_FREQ = 62_500_000
 # changes almost nothing (7.57 -> 7.28), because neighbouring sensor pixels
 # already share a colour at 0.5 degC per step -- there is nothing to
 # interpolate between.
-SMOOTH = True
+SMOOTH = False
 
 SRC_W, SRC_H = 32, 24
 IMG_W, IMG_H = SRC_W * 6, SRC_H * 6             # 192 x 144 either way
