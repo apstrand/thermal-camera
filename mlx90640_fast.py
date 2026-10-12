@@ -49,6 +49,8 @@ from adafruit_mlx90640 import SCALEALPHA, OPENAIR_TA_SHIFT
 # 768 ptatArt, 776 CP subpage 0, 778 gain, 800 ptat, 808 CP subpage 1, 810 vdd.
 N_WORDS = 811
 N_PIX = 768
+SRC_W = 32
+SRC_H = 24
 
 _STATUS_REG = 0x8000
 _RAM_BASE = 0x0400
@@ -66,12 +68,19 @@ _W_VDD = 810
 TA_RECALC = 0.05
 VDD_RECALC = 0.002
 
+# Motion-adaptive de-interlacing thresholds, in degC of change per pixel
+# between successive measurements of the same subpage. Below LOW the pixel is
+# left alone (that much is sensor noise, roughly 0.1-0.3 K here); above HIGH
+# it is fully replaced by the interpolation of its fresh neighbours.
+DL_LOW = 0.3
+DL_HIGH = 1.5
+
 
 class FastMLX90640(adafruit_mlx90640.MLX90640):
     """MLX90640 with a vectorised, allocation-free frame path."""
 
     def __init__(self, i2c_bus, address=0x33, emissivity=0.95, release_cal=True,
-                 refine=True):
+                 refine=True, deinterlace=False):
         """release_cal frees the stock driver's per-pixel Python lists once
         they have been folded into ulab arrays, recovering about 15 kB. That
         makes the inherited getFrame() unusable, so pass False to keep it
@@ -85,6 +94,7 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         self.subpage = 0
         self._release_cal = release_cal
         self.refine = refine
+        self.deinterlace = deinterlace
         self._raw = bytearray(2 * N_WORDS)
         self._addrbuf = bytearray(2)
         self._cmdbuf = bytearray(4)
@@ -147,7 +157,8 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         # i.e. 1 / (SCALEALPHA * alphaScale / alpha[p]).
         alpha_recip = [0.0] * N_PIX
         chess = [0.0] * N_PIX if chess_correction else None
-        subpage_of = [0.0] * N_PIX if self.tgc else None
+        subpage_of = ([0.0] * N_PIX
+                      if (self.tgc or self.deinterlace) else None)
 
         c1 = self.ilChessC[1]
         c2 = self.ilChessC[2]
@@ -187,6 +198,31 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
             np.array(subpage_of, dtype=f) if subpage_of is not None else None
         )
         self._bad = sorted(set(self.brokenPixels) | set(self.outlierPixels))
+
+        if self.deinterlace:
+            # Static per-pixel data for _deinterlace: the reciprocal of each
+            # pixel's orthogonal-neighbour count, and, for each subpage, which
+            # pixels are the stale half when that subpage was just measured.
+            inv_count = [0.0] * N_PIX
+            stale0 = [0.0] * N_PIX
+            stale1 = [0.0] * N_PIX
+            for p in range(N_PIX):
+                r, c = p // SRC_W, p % SRC_W
+                n = (1 if r else 0) + (1 if r < SRC_H - 1 else 0)
+                n += (1 if c else 0) + (1 if c < SRC_W - 1 else 0)
+                inv_count[p] = 1.0 / n
+                if subpage_of[p]:
+                    stale0[p] = 1.0      # belongs to subpage 1
+                else:
+                    stale1[p] = 1.0      # belongs to subpage 0
+            self._dl_inv_count = np.array(inv_count, dtype=f)
+            self._dl_stale = (np.array(stale0, dtype=f), np.array(stale1, dtype=f))
+            self._dl_sum = np.zeros(N_PIX, dtype=f)
+            self._dl_motion = np.zeros(N_PIX, dtype=f)
+            self._dl_weight = np.zeros(N_PIX, dtype=f)
+            self._dl_prev = np.zeros(N_PIX, dtype=f)
+            self._dl_primed = False
+            del inv_count, stale0, stale1
 
         # Working buffers: q holds the pixel term, to the iterate/result, s
         # the scratch denominator. Everything per-frame happens in these.
@@ -373,6 +409,8 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
 
         for p in self._bad:
             to[p] = to[p + 1] if p == 0 else to[p - 1]
+        if self.deinterlace:
+            self._deinterlace(to)
         return to
 
     def _quartic_root(self, buf):
@@ -390,6 +428,80 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         np.sqrt(buf, out=buf)
         np.sqrt(buf, out=buf)
         buf -= 273.15
+
+    def _nbr_mean(self, src, dst):
+        """dst = mean of each pixel's orthogonal neighbours in src."""
+        dst[:] = 0.0
+        # Vertical neighbours are a whole row apart, so nothing wraps.
+        dst[SRC_W:] += src[:N_PIX - SRC_W]
+        dst[:N_PIX - SRC_W] += src[SRC_W:]
+        # Horizontal neighbours wrap between rows in a flat array, which
+        # would pull in a same-parity (stale) pixel. Undo those 46 cases.
+        dst[1:] += src[:N_PIX - 1]
+        dst[:N_PIX - 1] += src[1:]
+        for r in range(1, SRC_H):
+            i = r * SRC_W
+            dst[i] -= src[i - 1]
+        for r in range(SRC_H - 1):
+            i = r * SRC_W + SRC_W - 1
+            dst[i] -= src[i + 1]
+        dst *= self._dl_inv_count
+
+    def _deinterlace(self, to):
+        """Repair the chess-pattern readout artifact, in place.
+
+        The sensor splits its pixels into two subpages and measures one per
+        refresh period, so every frame holds pixels taken one period apart
+        (62.5 ms at REFRESH_16_HZ). On a moving edge the two halves disagree,
+        and because chess mode interleaves them as a checkerboard -- a
+        pixel's subpage is (row + col) & 1 -- the disagreement shows up as
+        one.
+
+        This is inherent to the readout rather than to reading one subpage
+        per frame: the stock driver reads subpage A then B, which were also
+        measured a period apart.
+
+        Every stale pixel's four orthogonal neighbours are in the other
+        subpage, hence fresh, so the stale half can be interpolated from the
+        fresh half exactly. Doing that everywhere would discard half the real
+        measurements and soften every edge, so it is blended in only where
+        there is motion.
+
+        Motion is measured temporally, by how much a pixel changed since the
+        last measurement of its own subpage -- not by how far it sits from
+        its neighbours. The latter is tempting and much cheaper, but it
+        cannot tell a stale pixel from a genuinely sharp static edge, and
+        measurably softens such edges by about a quarter.
+        """
+        if not self._dl_primed:
+            self._dl_prev[:] = to
+            self._dl_primed = True
+            return
+
+        s = self._dl_sum
+        self._nbr_mean(to, s)                # what the fresh half predicts
+
+        # |to - prev| as sqrt(v*v), which has an out= form and so allocates
+        # nothing. For a fresh pixel this spans two subpage periods, since
+        # its previous value was itself one period old.
+        m = self._dl_motion
+        m[:] = to
+        m -= self._dl_prev
+        m *= m
+        np.sqrt(m, out=m)
+        self._dl_prev[:] = to
+
+        # A stale pixel is suspect when its *fresh* neighbours are moving.
+        w = self._dl_weight
+        self._nbr_mean(m, w)
+        w -= DL_LOW
+        w *= 1.0 / (DL_HIGH - DL_LOW)
+        w = np.clip(w, 0.0, 1.0)
+        w *= self._dl_stale[self.subpage]    # only touch the stale half
+
+        d = s - to
+        d *= w
+        to += d
 
     def palette_bytes(self, lo, span, count):
         """Map the last temperatures() result to `count` palette indices.
