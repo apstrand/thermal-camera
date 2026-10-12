@@ -29,9 +29,9 @@ from st7789_fast import FastST7789
 # no faster than 16 and quadrupled the torn-frame count.
 REFRESH_RATE = adafruit_mlx90640.RefreshRate.REFRESH_16_HZ
 I2C_FREQ = 1_000_000       # MLX90640 supports FM+
-# busio.SPI rounds DOWN to clk_peri/even, so 25 MHz silently becomes 20.8.
-# 62.5 MHz is exact and measured 6.53 MB/s through busio.SPI.write.
-SPI_FREQ = 62_500_000
+# The panel is driven by a PIO state machine, not busio.SPI, so this clocks
+# from clk_sys and survives the overclock. 62.5 Mbit/s measured 7.7 MB/s.
+PANEL_BIT_RATE = 62_500_000
 
 # SMOOTH interpolates the temperature field 2x before colouring, so blocks
 # are 3x3 instead of 6x6 and their edges are graded.
@@ -49,20 +49,23 @@ SPI_FREQ = 62_500_000
 # interpolate between.
 SMOOTH = False
 
-# Overclock, in MHz. None leaves the system clock alone, which is what you
-# want unless you have a reason: merely ASSIGNING cpu.frequency -- even the
-# stock 125 -- makes CircuitPython re-point clk_peri to 48 MHz, which caps
-# busio.SPI at 24 MHz and costs more than the extra clock gains. Measured at
-# 192x144 with no smoothing:
+# Overclock, in MHz. None leaves the system clock alone. Measured at 192x144
+# with no smoothing, driving the panel from PIO:
 #
-#   None  ->  125 MHz, SPI 62.5 MHz   10.0 fps   (default)
-#   250   ->  250 MHz, SPI 24   MHz   13.5 fps
-#   125   ->  125 MHz, SPI 24   MHz    8.8 fps   <- pointless, see above
+#   None / 125  ->  10.2 fps
+#   250         ->  15.7 fps   (REFRESH_16_HZ gives 16 subpages/s, so this is
+#                               the sensor's own ceiling, not the code's)
 #
-# At 250 the conversion halves (27 -> 13 ms) while the I2C read barely moves
-# (19.4 -> 17.8 ms), that being bus-bound at 1 MHz. 250 MHz is a common
-# RP2040 overclock but sits outside the datasheet's guarantee, and it does
-# not survive a power cycle.
+# At 250 the conversion halves, 27 -> 13 ms, while the I2C read barely moves,
+# 19.4 -> 17.8 ms, being bus-bound at 1 MHz.
+#
+# Assigning cpu.frequency makes CircuitPython re-point clk_peri to 48 MHz,
+# which caps busio.SPI at 24 MHz; that used to make this a poor trade. It no
+# longer applies, because st7789_fast drives the panel from a PIO state
+# machine, and PIO clocks from clk_sys.
+#
+# 250 MHz is a common RP2040 overclock but sits outside the datasheet's
+# guarantee, hence opt-in. It does not survive a power cycle.
 CPU_MHZ = None
 
 SRC_W, SRC_H = 32, 24
@@ -104,14 +107,12 @@ mlx.refresh_rate = REFRESH_RATE
 pixel.fill((255, 255, 0))
 print("MLX serial:", [hex(i) for i in mlx.serial_number])
 
-spi = busio.SPI(clock=board.GP2, MOSI=board.GP3, MISO=board.GP4)
-while not spi.try_lock():
-    pass
-spi.configure(baudrate=SPI_FREQ)
-print("CPU", microcontroller.cpu.frequency, "SPI", spi.frequency)
-spi.unlock()
-
-disp = FastST7789(spi, command=board.GP0, chip_select=board.GP1, reset=board.GP8)
+disp = FastST7789(
+    clock=board.GP2, mosi=board.GP3,
+    command=board.GP0, chip_select=board.GP1, reset=board.GP8,
+    bit_rate=PANEL_BIT_RATE,
+)
+print("CPU", microcontroller.cpu.frequency, "panel", disp.bit_rate, "bit/s")
 disp.fill(0, 0, 240, 320, BG565)
 pixel.fill((0, 255, 255))
 
@@ -200,7 +201,7 @@ while True:
         font5x7.draw(text_strip, TEXT_W, "%.1f FPS" % fps, 0, 24, 0xFF, 0xFF)
         disp.set_window(TEXT_X, TEXT_Y, TEXT_X + TEXT_W - 1, TEXT_Y + TEXT_H - 1)
         disp.begin_pixels()
-        spi.write(text_strip)
+        disp.write_pixels(text_strip)
         disp.end_pixels()
 
         now = time.monotonic_ns()

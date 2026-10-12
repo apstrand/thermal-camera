@@ -16,7 +16,6 @@ orientation and the mirroring.
 import time
 
 import board
-import busio
 import displayio
 from ulab import numpy as np
 
@@ -30,12 +29,10 @@ ROW_BYTES = IMG_W * 2
 BG565 = 0x2104
 
 displayio.release_displays()
-spi = busio.SPI(clock=board.GP2, MOSI=board.GP3, MISO=board.GP4)
-while not spi.try_lock():
-    pass
-spi.configure(baudrate=62_500_000)
-spi.unlock()
-disp = FastST7789(spi, command=board.GP0, chip_select=board.GP1, reset=board.GP8)
+disp = FastST7789(
+    clock=board.GP2, mosi=board.GP3,
+    command=board.GP0, chip_select=board.GP1, reset=board.GP8,
+)
 disp.fill(0, 0, 240, 320, BG565)
 
 row_ba = bytearray(ROW_BYTES * SRC_H)
@@ -80,7 +77,7 @@ font5x7.draw(strip, TEXT_W, "COLD 0 -", 0, 16, 0xFF, 0xFF)
 font5x7.draw(strip, TEXT_W, "-123.456", 0, 24, 0xFF, 0xFF)
 disp.set_window(IMG_X, IMG_Y + IMG_H + 24, IMG_X + TEXT_W - 1, IMG_Y + IMG_H + 24 + TEXT_H - 1)
 disp.begin_pixels()
-spi.write(strip)
+disp.write_pixels(strip)
 disp.end_pixels()
 
 print("selftest pattern drawn:")
