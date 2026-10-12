@@ -12,6 +12,7 @@ import time
 import board
 import busio
 import displayio
+import microcontroller
 import neopixel
 from ulab import numpy as np
 
@@ -48,6 +49,22 @@ SPI_FREQ = 62_500_000
 # interpolate between.
 SMOOTH = False
 
+# Overclock, in MHz. None leaves the system clock alone, which is what you
+# want unless you have a reason: merely ASSIGNING cpu.frequency -- even the
+# stock 125 -- makes CircuitPython re-point clk_peri to 48 MHz, which caps
+# busio.SPI at 24 MHz and costs more than the extra clock gains. Measured at
+# 192x144 with no smoothing:
+#
+#   None  ->  125 MHz, SPI 62.5 MHz   10.0 fps   (default)
+#   250   ->  250 MHz, SPI 24   MHz   13.5 fps
+#   125   ->  125 MHz, SPI 24   MHz    8.8 fps   <- pointless, see above
+#
+# At 250 the conversion halves (27 -> 13 ms) while the I2C read barely moves
+# (19.4 -> 17.8 ms), that being bus-bound at 1 MHz. 250 MHz is a common
+# RP2040 overclock but sits outside the datasheet's guarantee, and it does
+# not survive a power cycle.
+CPU_MHZ = None
+
 SRC_W, SRC_H = 32, 24
 IMG_W, IMG_H = SRC_W * 6, SRC_H * 6             # 192 x 144 either way
 IMG_X, IMG_Y = (240 - IMG_W) // 2, 24
@@ -59,6 +76,16 @@ TEXT_EVERY = 8
 TEMP_LO = 10.0             # degC at the cold end of the ramp
 TEMP_SPAN = 0.5            # degC per colour step, 64 steps -> 10.0 .. 41.5
 BG565 = 0x2104             # dark grey, big-endian RGB565
+
+# Before anything claims a bus: SPI and I2C dividers are derived from
+# clk_peri when the peripheral is constructed, so the clock must settle
+# first.
+if CPU_MHZ:
+    try:
+        microcontroller.cpu.frequency = CPU_MHZ * 1_000_000
+    except (ValueError, RuntimeError) as err:
+        print("CPU_MHZ=%s rejected (%s), staying at %d"
+              % (CPU_MHZ, err, microcontroller.cpu.frequency))
 
 # CircuitPython keeps displays alive across soft reloads, so a display left
 # over from a previous run would still be holding the SPI pins.
@@ -81,7 +108,7 @@ spi = busio.SPI(clock=board.GP2, MOSI=board.GP3, MISO=board.GP4)
 while not spi.try_lock():
     pass
 spi.configure(baudrate=SPI_FREQ)
-print("SPI", spi.frequency)
+print("CPU", microcontroller.cpu.frequency, "SPI", spi.frequency)
 spi.unlock()
 
 disp = FastST7789(spi, command=board.GP0, chip_select=board.GP1, reset=board.GP8)
