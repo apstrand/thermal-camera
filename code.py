@@ -102,6 +102,26 @@ TEXT_EVERY = 8
 
 TEMP_LO = 10.0             # degC at the cold end of the ramp
 TEMP_SPAN = 0.5            # degC per colour step, 64 steps -> 10.0 .. 41.5
+
+# AUTO_RANGE re-aims the ramp at whatever the scene actually contains, each
+# frame. The fixed 10.0 .. 41.5 above suits a scene with a person in it; a
+# room-temperature wall spans about 5 degC, which is 10 of the 64 colour
+# steps, and shows as a near-uniform block. TEMP_LO/TEMP_SPAN become just
+# the starting point when this is on.
+#
+# The ends are taken as percentiles rather than min/max so one hot pixel or
+# a dead one cannot define the whole scale, and the result is smoothed over
+# time, because re-aiming the ramp every frame from raw extremes makes the
+# whole image breathe. MIN_SPAN stops the ramp collapsing onto the noise
+# when pointed at something genuinely flat.
+AUTO_RANGE = True
+AR_TRIM = 0.02             # fraction of pixels ignored at each end
+AR_SMOOTH = 0.15           # per-frame approach rate of the range
+# 8 degC over 63 steps is 0.13 degC per step, against the 0.21 degC of
+# residual noise measured at REFRESH_16_HZ with DENOISE on -- so noise costs
+# under two colour steps. Narrower than this and the ramp mostly displays
+# noise: at 3 degC it is four steps, which is what the first attempt did.
+AR_MIN_SPAN = 8.0          # degC, narrowest the ramp is allowed to get
 BG565 = 0x2104             # dark grey, big-endian RGB565
 
 # Before anything claims a bus: SPI and I2C dividers are derived from
@@ -195,6 +215,11 @@ print("free heap after setup:", gc.mem_free())
 pixel.brightness = 0.1
 pixel.fill((0, 200, 0))
 
+AR_LO_IDX = int(768 * AR_TRIM)
+AR_HI_IDX = 768 - 1 - AR_LO_IDX
+rng_lo = TEMP_LO
+rng_hi = TEMP_LO + TEMP_SPAN * 63.0
+
 tick = 0
 fps = 0.0
 errors = 0
@@ -207,6 +232,18 @@ while True:
     except (RuntimeError, OSError):
         errors += 1
         continue
+
+    if AUTO_RANGE:
+        srt = np.sort(temps)
+        lo_t = srt[AR_LO_IDX]
+        hi_t = srt[AR_HI_IDX]
+        if hi_t - lo_t < AR_MIN_SPAN:
+            mid = (hi_t + lo_t) * 0.5
+            lo_t = mid - AR_MIN_SPAN * 0.5
+            hi_t = mid + AR_MIN_SPAN * 0.5
+        rng_lo += (lo_t - rng_lo) * AR_SMOOTH
+        rng_hi += (hi_t - rng_hi) * AR_SMOOTH
+        render.set_range(rng_lo, (rng_hi - rng_lo) / 63.0)
 
     render.draw(temps)
 
@@ -222,7 +259,12 @@ while True:
         font5x7.draw(text_strip, TEXT_W, "MIN %.1f" % lo, 0, 0, 0xFF, 0xFF)
         font5x7.draw(text_strip, TEXT_W, "MAX %.1f" % hi, 0, 8, 0xFF, 0xFF)
         font5x7.draw(text_strip, TEXT_W, "CTR %.1f" % cen, 0, 16, 0xFF, 0xFF)
-        font5x7.draw(text_strip, TEXT_W, "%.1f FPS" % fps, 0, 24, 0xFF, 0xFF)
+        if AUTO_RANGE:
+            font5x7.draw(text_strip, TEXT_W, "R %.0f-%.0f %.0fF"
+                         % (rng_lo, rng_hi, fps), 0, 24, 0xFF, 0xFF)
+        else:
+            font5x7.draw(text_strip, TEXT_W, "%.1f FPS" % fps, 0, 24,
+                         0xFF, 0xFF)
         disp.set_window(TEXT_X, TEXT_Y, TEXT_X + TEXT_W - 1, TEXT_Y + TEXT_H - 1)
         disp.begin_pixels()
         disp.write_pixels(text_strip)

@@ -77,6 +77,11 @@ class _Base:
         self.x0 = x0
         self.y0 = y0
 
+    def set_range(self, lo, span):
+        """Re-aim the colour ramp. span is degC per colour step."""
+        self.lo = lo
+        self.inv_span = 1.0 / span
+
     def _window(self):
         self.disp.set_window(
             self.x0, self.y0, self.x0 + self.W - 1, self.y0 + self.H - 1
