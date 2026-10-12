@@ -68,19 +68,29 @@ _W_VDD = 810
 TA_RECALC = 0.05
 VDD_RECALC = 0.002
 
-# Motion-adaptive de-interlacing thresholds, in degC of change per pixel
-# between successive measurements of the same subpage. Below LOW the pixel is
-# left alone (that much is sensor noise, roughly 0.1-0.3 K here); above HIGH
-# it is fully replaced by the interpolation of its fresh neighbours.
-DL_LOW = 0.3
-DL_HIGH = 1.5
+# Motion thresholds, in degC of change per pixel between successive
+# measurements of the same subpage. Below LOW the pixel counts as still.
+# These MUST sit above the sensor's own noise floor, which on this part at
+# REFRESH_16_HZ measures about 0.58 degC std frame to frame
+# -- far more than the 0.1-0.3 K the datasheet's NETD would suggest. Setting
+# LOW below it makes every feature here fire on noise, which measurably made
+# the artifact worse rather than better.
+DL_LOW = 1.8
+DL_HIGH = 3.5
+
+# Temporal filter strength for a pixel the motion detector thinks is still:
+# the fraction of the new measurement folded into the running value each
+# frame. 0.3 gives an effective average of about 6 frames, so independent
+# noise drops by roughly 2.4x. Moving pixels ramp to 1.0 (no filtering) so
+# nothing smears.
+DN_ALPHA = 0.3
 
 
 class FastMLX90640(adafruit_mlx90640.MLX90640):
     """MLX90640 with a vectorised, allocation-free frame path."""
 
     def __init__(self, i2c_bus, address=0x33, emissivity=0.95, release_cal=True,
-                 refine=True, deinterlace=False):
+                 refine=True, deinterlace=False, denoise=False):
         """release_cal frees the stock driver's per-pixel Python lists once
         they have been folded into ulab arrays, recovering about 15 kB. That
         makes the inherited getFrame() unusable, so pass False to keep it
@@ -95,6 +105,7 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         self._release_cal = release_cal
         self.refine = refine
         self.deinterlace = deinterlace
+        self.denoise = denoise
         self._raw = bytearray(2 * N_WORDS)
         self._addrbuf = bytearray(2)
         self._cmdbuf = bytearray(4)
@@ -158,7 +169,8 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         alpha_recip = [0.0] * N_PIX
         chess = [0.0] * N_PIX if chess_correction else None
         subpage_of = ([0.0] * N_PIX
-                      if (self.tgc or self.deinterlace) else None)
+                      if (self.tgc or self.deinterlace or self.denoise)
+                      else None)
 
         c1 = self.ilChessC[1]
         c2 = self.ilChessC[2]
@@ -199,7 +211,7 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         )
         self._bad = sorted(set(self.brokenPixels) | set(self.outlierPixels))
 
-        if self.deinterlace:
+        if self.deinterlace or self.denoise:
             # Static per-pixel data for _deinterlace: the reciprocal of each
             # pixel's orthogonal-neighbour count, and, for each subpage, which
             # pixels are the stale half when that subpage was just measured.
@@ -221,6 +233,7 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
             self._dl_motion = np.zeros(N_PIX, dtype=f)
             self._dl_weight = np.zeros(N_PIX, dtype=f)
             self._dl_prev = np.zeros(N_PIX, dtype=f)
+            self._dl_out = np.zeros(N_PIX, dtype=f)
             self._dl_primed = False
             del inv_count, stale0, stale1
 
@@ -372,44 +385,44 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         to += ta_tr
         self._quartic_root(to)
 
-        if not self.refine:
-            for p in self._bad:
-                to[p] = to[p + 1] if p == 0 else to[p - 1]
-            return to
-
-        # pass 3: coefficients chosen per ksTo range. A scene confined to one
-        # range -- the normal case -- needs only two scalars.
-        a_tab = self._range_a
-        b_tab = self._range_b
-        r_lo = self._range_of(np.min(to), ct)
-        r_hi = self._range_of(np.max(to), ct)
-        if r_lo == r_hi:
-            s[:] = to
-            s *= b_tab[r_lo]
-            s += a_tab[r_lo]
-        else:
-            # Thresholds nest, so summing the deltas telescopes to the right
-            # coefficient per pixel. This path allocates, but only fires when
-            # a scene straddles a ksTo breakpoint.
-            s[:] = to
-            s *= b_tab[0]
-            s += a_tab[0]
-            for r in range(1, 4):
-                g = np.array(to >= ct[r], dtype=np.float)
-                g *= b_tab[r] - b_tab[r - 1]
-                g *= to
-                s += g
-                g = np.array(to >= ct[r], dtype=np.float)
-                g *= a_tab[r] - a_tab[r - 1]
-                s += g
-        to[:] = q
-        to /= s
-        to += ta_tr
-        self._quartic_root(to)
+        # Pass 3 is optional. The temporal repairs at the end of this
+        # method are NOT, so this has to be a branch rather than an
+        # early return: it was one, which silently disabled both of
+        # them for every caller passing refine=False.
+        if self.refine:
+            # pass 3: coefficients chosen per ksTo range. A scene confined to one
+            # range -- the normal case -- needs only two scalars.
+            a_tab = self._range_a
+            b_tab = self._range_b
+            r_lo = self._range_of(np.min(to), ct)
+            r_hi = self._range_of(np.max(to), ct)
+            if r_lo == r_hi:
+                s[:] = to
+                s *= b_tab[r_lo]
+                s += a_tab[r_lo]
+            else:
+                # Thresholds nest, so summing the deltas telescopes to the right
+                # coefficient per pixel. This path allocates, but only fires when
+                # a scene straddles a ksTo breakpoint.
+                s[:] = to
+                s *= b_tab[0]
+                s += a_tab[0]
+                for r in range(1, 4):
+                    g = np.array(to >= ct[r], dtype=np.float)
+                    g *= b_tab[r] - b_tab[r - 1]
+                    g *= to
+                    s += g
+                    g = np.array(to >= ct[r], dtype=np.float)
+                    g *= a_tab[r] - a_tab[r - 1]
+                    s += g
+            to[:] = q
+            to /= s
+            to += ta_tr
+            self._quartic_root(to)
 
         for p in self._bad:
             to[p] = to[p + 1] if p == 0 else to[p - 1]
-        if self.deinterlace:
+        if self.deinterlace or self.denoise:
             self._deinterlace(to)
         return to
 
@@ -475,11 +488,13 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         """
         if not self._dl_primed:
             self._dl_prev[:] = to
+            self._dl_out[:] = to
             self._dl_primed = True
             return
 
         s = self._dl_sum
-        self._nbr_mean(to, s)                # what the fresh half predicts
+        if self.deinterlace:
+            self._nbr_mean(to, s)            # what the fresh half predicts
 
         # |to - prev| as sqrt(v*v), which has an out= form and so allocates
         # nothing. For a fresh pixel this spans two subpage periods, since
@@ -491,17 +506,50 @@ class FastMLX90640(adafruit_mlx90640.MLX90640):
         np.sqrt(m, out=m)
         self._dl_prev[:] = to
 
-        # A stale pixel is suspect when its *fresh* neighbours are moving.
+        # Build one consistent motion estimate. A fresh pixel has its own
+        # |change|; a stale one has none -- it was not remeasured, so its
+        # zero means "no data", not "no motion" -- and must borrow the
+        # estimate from its fresh neighbours. Using the neighbour mean
+        # everywhere instead gives the estimate itself a checkerboard
+        # structure, which then modulates the filters in a checkerboard and
+        # defeats the whole exercise.
+        sp = self.subpage
         w = self._dl_weight
         self._nbr_mean(m, w)
+        w *= self._dl_stale[sp]              # neighbour estimate, stale half
+        m *= self._dl_stale[1 - sp]          # own estimate, fresh half
+        w += m
+
         w -= DL_LOW
         w *= 1.0 / (DL_HIGH - DL_LOW)
-        w = np.clip(w, 0.0, 1.0)
-        w *= self._dl_stale[self.subpage]    # only touch the stale half
+        w = np.clip(w, 0.0, 1.0)             # 0 where still, 1 where moving
 
-        d = s - to
-        d *= w
-        to += d
+        if self.deinterlace:
+            d = s - to
+            d *= w
+            d *= self._dl_stale[sp]             # only touch the stale half
+            to += d
+
+        if self.denoise:
+            # Fold the new measurement into a running value, gently where the
+            # scene is still (averaging the noise down) and completely where
+            # it moves (so nothing smears).
+            #
+            # Only the fresh half is folded in. A stale pixel carries the
+            # same number it did last frame, so folding it again would just
+            # converge the filter onto that one measurement instead of
+            # averaging several independent ones -- which cuts the effective
+            # sample count from 1/alpha to about 2 and was why this barely
+            # helped at first.
+            a = w
+            a *= 1.0 - DN_ALPHA
+            a += DN_ALPHA
+            a *= self._dl_stale[1 - sp]      # fresh half only
+            out = self._dl_out
+            d = to - out
+            d *= a
+            out += d
+            to[:] = out
 
     def palette_bytes(self, lo, span, count):
         """Map the last temperatures() result to `count` palette indices.
