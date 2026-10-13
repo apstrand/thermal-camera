@@ -27,7 +27,7 @@ from st7789_fast import FastST7789
 # The sensor emits one subpage per period; a displayed frame uses one. 2 Hz
 # (the original setting) therefore capped everything at 1 fps. 32 Hz measured
 # no faster than 16 and quadrupled the torn-frame count.
-REFRESH_RATE = adafruit_mlx90640.RefreshRate.REFRESH_16_HZ
+REFRESH_RATE = adafruit_mlx90640.RefreshRate.REFRESH_8_HZ
 I2C_FREQ = 1_000_000       # MLX90640 supports FM+
 # The panel is driven by a PIO state machine, not busio.SPI, so this clocks
 # from clk_sys and survives the overclock. 62.5 Mbit/s measured 7.7 MB/s.
